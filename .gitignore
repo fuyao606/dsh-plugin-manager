@@ -1,0 +1,9 @@
+# 依赖
+node_modules/
+
+# 临时文件
+.tmp-*
+*.log
+.DS_Store
+
+# 构建产物刻意提交（lib/），以便 `dsh plugin add github:...` 免构建脚本安装

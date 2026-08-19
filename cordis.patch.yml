@@ -1,0 +1,8 @@
+# dsh-plugin-manager bundle patch
+# Host 半：挂载插件管理器的 /plugin-manager API（列表/启用/禁用/安装/卸载）。
+# client 半由 package.json 的 dsh.client manifest 按包名加载。
+- insert:
+    - id: plugin-manager
+      name: dsh-plugin-manager
+      config:
+        profile: web
