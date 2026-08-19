@@ -18,13 +18,13 @@
 仓库已提交构建产物 `lib/`，直接装：
 
 ```sh
-dsh plugin --profile web add github:<你的用户名>/dsh-plugin-manager
+dsh plugin --profile web add github:fuyao606/dsh-plugin-manager
 ```
 
 ### 方式二：本地开发
 
 ```sh
-git clone https://github.com/<你的用户名>/dsh-plugin-manager.git
+git clone https://github.com/fuyao606/dsh-plugin-manager.git
 cd dsh-plugin-manager
 pnpm install
 pnpm build
