@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "在 DeepSeek Harness Web GUI 内管理本机插件：列出 / 启用 / 禁用 / 安装 / 卸载 web profile 的插件。",
   "type": "module",
   "main": "lib/index.js",

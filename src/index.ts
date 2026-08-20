@@ -18,9 +18,10 @@
  * 只允许安全字符，避免经 `shell: true` 的 pnpm 调用被注入。
  */
 import { spawn } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+
 
 // ── 结构化类型（不与 @deepseek-ai/* 产生值依赖，只声明用到的服务面） ──────────
 
@@ -60,6 +61,23 @@ interface Manifest {
   dsh?: { profile?: { bundles?: string[] } }
 }
 
+interface PackageInfo {
+  version?: string
+  description?: string
+  dsh?: { bundle?: { patch?: string } }
+}
+
+interface BundleAnalysis {
+  isBundle: boolean
+  patchIds: string[]
+}
+
+interface ProfileSnapshot {
+  manifest: string
+  lockfile?: string
+  lockfileName?: string
+}
+
 export const name = 'dsh-plugin-manager'
 export const inject = ['webServer', 'webRuntime']
 
@@ -96,16 +114,30 @@ function pkgDir(dir: string, name: string): string {
   return join(dir, 'node_modules', ...name.split('/'))
 }
 
-/** 该依赖是否声明了 dsh.bundle（即是否作为 profile 层挂载）。 */
-async function isBundle(dir: string, name: string): Promise<boolean> {
+async function readPackageInfo(dir: string, name: string): Promise<PackageInfo | null> {
   try {
-    const pkg = JSON.parse(await readFile(join(pkgDir(dir, name), 'package.json'), 'utf8')) as {
-      dsh?: { bundle?: { patch?: string } }
-    }
-    return pkg.dsh?.bundle?.patch !== undefined
+    return JSON.parse(await readFile(join(pkgDir(dir, name), 'package.json'), 'utf8')) as PackageInfo
   } catch {
-    return false
+    return null
   }
+}
+
+/** Extract IDs from the supported Cordis patch insert form. */
+async function analyzeBundle(dir: string, name: string): Promise<BundleAnalysis> {
+  const pkg = await readPackageInfo(dir, name)
+  const patch = pkg?.dsh?.bundle?.patch
+  if (patch === undefined) return { isBundle: false, patchIds: [] }
+  try {
+    const text = await readFile(join(pkgDir(dir, name), patch), 'utf8')
+    const ids = [...text.matchAll(/^\s*-?\s*id:\s*['\"]?([^\s'\"]+)['\"]?\s*$/gm)].map((match) => match[1]).filter((id): id is string => id !== undefined)
+    return { isBundle: true, patchIds: [...new Set(ids)] }
+  } catch {
+    return { isBundle: true, patchIds: [] }
+  }
+}
+
+async function isBundle(dir: string, name: string): Promise<boolean> {
+  return (await analyzeBundle(dir, name)).isBundle
 }
 
 function header(headers: HttpRequestLike['headers'], name: string): string | undefined {
@@ -201,10 +233,10 @@ function serialize<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-function runPnpm(args: string[], profileDir: string): Promise<{ code: number; output: string }> {
+function runCommand(command: string, args: string[], cwd: string): Promise<{ code: number; output: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('pnpm', args, {
-      cwd: profileDir,
+    const child = spawn(command, args, {
+      cwd,
       shell: process.platform === 'win32',
       windowsHide: true,
       env: { ...process.env, CI: '1' },
@@ -217,42 +249,90 @@ function runPnpm(args: string[], profileDir: string): Promise<{ code: number; ou
   })
 }
 
-/**
- * 按安装状态对账 dsh.profile.bundles —— 等价于 `dsh plugin` 的 reconcilePlugins：
- * 依赖里声明了 dsh.bundle 的包进入 bundles（按依赖顺序追加）；曾经是依赖、现在
- * 不再是的包从 bundles 移除。内置 base bundles（非依赖）永不触碰。
- */
-async function reconcileBundles(
-  dir: string,
-  before: Manifest,
-  after: Manifest,
-): Promise<Manifest> {
+function runPnpm(args: string[], profileDir: string): Promise<{ code: number; output: string }> {
+  return runCommand('pnpm', args, profileDir)
+}
+
+async function readDumpConfigIds(profileDir: string): Promise<Set<string>> {
+  const result = await runCommand('dsh', ['--profile', 'web', '--dump-config'], profileDir)
+  if (result.code !== 0) return new Set()
+  const ids = new Set<string>()
+  for (const match of result.output.matchAll(/(?:^|[\s"'])id["']?\s*[:=]\s*["']([^"']+)["']/g)) ids.add(match[1]!)
+  return ids
+}
+
+async function snapshotProfile(dir: string): Promise<ProfileSnapshot> {
+  const manifest = await readFile(join(dir, 'package.json'), 'utf8')
+  for (const lockfileName of ['pnpm-lock.yaml', 'pnpm-lock.yml']) {
+    try {
+      return { manifest, lockfile: await readFile(join(dir, lockfileName), 'utf8'), lockfileName }
+    } catch {
+      // Try the next supported pnpm lockfile name.
+    }
+  }
+  return { manifest }
+}
+
+async function restoreProfile(dir: string, snapshot: ProfileSnapshot): Promise<void> {
+  await writeFile(join(dir, 'package.json'), snapshot.manifest, 'utf8')
+  if (snapshot.lockfile !== undefined && snapshot.lockfileName !== undefined) {
+    await writeFile(join(dir, snapshot.lockfileName), snapshot.lockfile, 'utf8')
+  }
+}
+
+async function inspectSpec(profileDir: string, spec: string, occupied: Set<string>): Promise<{
+  name: string
+  version: string
+  analysis: BundleAnalysis
+  conflicts: string[]
+}> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-manager-'))
+  try {
+    await writeFile(join(tempDir, 'package.json'), JSON.stringify({ private: true }, null, 2), 'utf8')
+    const result = await runPnpm(['add', '--ignore-scripts', '--lockfile=false', spec], tempDir)
+    if (result.code !== 0) throw new ApiError('preflight-failed', `安装预检失败\n${tail(result.output)}`, 500)
+    const requestedName = spec.startsWith('@') ? spec.slice(1).split('@')[0] : spec.split('@')[0]
+    if (requestedName === undefined || requestedName === '') throw new ApiError('preflight-failed', '无法解析插件名', 500)
+    const name = spec.startsWith('@') ? `@${requestedName}` : requestedName
+    const pkg = await readPackageInfo(tempDir, name)
+    if (pkg === null) throw new ApiError('preflight-failed', `预检后找不到 ${name}`, 500)
+    const analysis = await analyzeBundle(tempDir, name)
+    const currentIds = new Set(occupied)
+    const conflicts = analysis.patchIds.filter((id) => currentIds.has(id))
+    return { name, version: pkg.version ?? '', analysis, conflicts }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+}
+
+async function reconcileBundles(dir: string, before: Manifest, after: Manifest, addedName?: string): Promise<Manifest> {
+  const bundles = [...(after.dsh?.profile?.bundles ?? [])]
+  if (addedName !== undefined && !bundles.includes(addedName) && await isBundle(dir, addedName)) {
+    bundles.push(addedName)
+    return { ...after, dsh: { ...after.dsh, profile: { ...after.dsh?.profile, bundles } } }
+  }
   const beforeDeps = new Set(Object.keys(before.dependencies ?? {}))
   const afterDeps = new Set(Object.keys(after.dependencies ?? {}))
-  const bundles = [...(after.dsh?.profile?.bundles ?? [])]
   let changed = false
-
-  for (const packageName of Object.keys(after.dependencies ?? {})) {
-    if (await isBundle(dir, packageName) && !bundles.includes(packageName)) {
-      bundles.push(packageName)
-      changed = true
-    }
-  }
   for (const packageName of [...bundles]) {
-    const wasDependency = beforeDeps.has(packageName) || afterDeps.has(packageName)
-    const stillBundle = afterDeps.has(packageName) && (await isBundle(dir, packageName))
-    if (wasDependency && !stillBundle) {
-      const index = bundles.indexOf(packageName)
-      if (index >= 0) bundles.splice(index, 1)
+    if ((beforeDeps.has(packageName) || afterDeps.has(packageName)) && !afterDeps.has(packageName)) {
+      bundles.splice(bundles.indexOf(packageName), 1)
       changed = true
     }
   }
+  return changed
+    ? { ...after, dsh: { ...after.dsh, profile: { ...after.dsh?.profile, bundles } } }
+    : after
+}
 
-  if (!changed) return after
-  return {
-    ...after,
-    dsh: { ...after.dsh, profile: { ...after.dsh?.profile, bundles } },
+async function occupiedBundleIds(dir: string, manifest: Manifest): Promise<Set<string>> {
+  const ids = await readDumpConfigIds(dir)
+  if (ids.size > 0) return ids
+  for (const name of manifest.dsh?.profile?.bundles ?? []) {
+    const analysis = await analyzeBundle(dir, name)
+    for (const id of analysis.patchIds) ids.add(id)
   }
+  return ids
 }
 
 // ── API 方法表 ──────────────────────────────────────────────────────────────
@@ -263,30 +343,21 @@ function buildApi(profileDir: string, logger?: HostContext['logger']) {
     const deps = manifest.dependencies ?? {}
     const bundles = manifest.dsh?.profile?.bundles ?? []
 
+    const occupied = await occupiedBundleIds(profileDir, manifest)
     const plugins = []
     for (const [name, range] of Object.entries(deps)) {
-      let version = ''
-      let description = ''
-      let bundle = false
-      try {
-        const pkg = JSON.parse(await readFile(join(pkgDir(profileDir, name), 'package.json'), 'utf8')) as {
-          version?: string
-          description?: string
-          dsh?: { bundle?: { patch?: string } }
-        }
-        version = pkg.version ?? ''
-        description = pkg.description ?? ''
-        bundle = pkg.dsh?.bundle?.patch !== undefined
-      } catch {
-        // 已声明但未落盘的依赖（例如 pnpm 未 install）——版本留空。
-      }
+      const pkg = await readPackageInfo(profileDir, name)
+      const analysis = await analyzeBundle(profileDir, name)
+      const conflicts = analysis.patchIds.filter((id) => occupied.has(id) && !bundles.includes(name))
       plugins.push({
         name,
         range,
-        version,
-        description,
-        isBundle: bundle,
+        version: pkg?.version ?? '',
+        description: pkg?.description ?? '',
+        isBundle: analysis.isBundle,
         enabled: bundles.includes(name),
+        status: !analysis.isBundle ? 'dependency' : conflicts.length > 0 ? 'blocked' : bundles.includes(name) ? 'enabled' : 'disabled',
+        conflicts,
       })
     }
     plugins.sort((a, b) => a.name.localeCompare(b.name))
@@ -302,7 +373,14 @@ function buildApi(profileDir: string, logger?: HostContext['logger']) {
     const manifest = await readManifest(profileDir)
     const bundles = manifest.dsh?.profile?.bundles ?? []
     const has = bundles.includes(name)
-    if (enabled && !has) bundles.push(name)
+    if (enabled && !has) {
+      const analysis = await analyzeBundle(profileDir, name)
+      if (!analysis.isBundle) throw new ApiError('not-bundle', '该依赖不是 DSH bundle，不能启用')
+      const occupied = await occupiedBundleIds(profileDir, manifest)
+      const conflicts = analysis.patchIds.filter((id) => occupied.has(id))
+      if (conflicts.length > 0) throw new ApiError('bundle-conflict', `不兼容当前 web profile\n冲突的 Cordis IDs：\n- ${conflicts.join('\n- ')}`, 409)
+      bundles.push(name)
+    }
     if (!enabled && has) {
       const index = bundles.indexOf(name)
       if (index >= 0) bundles.splice(index, 1)
@@ -318,14 +396,23 @@ function buildApi(profileDir: string, logger?: HostContext['logger']) {
       throw new ApiError('bad-request', '非法插件规格：只允许 npm 包名 + 可选 @version/tag，字符限于 a-z 0-9 . _ - / @')
     }
     const before = await readManifest(profileDir)
-    const { code, output } = await runPnpm(['add', spec], profileDir)
-    if (code !== 0) {
-      throw new ApiError('install-failed', `pnpm add 失败（exit ${code}）\n${tail(output)}`, 500)
+    const occupied = await occupiedBundleIds(profileDir, before)
+    const inspection = await inspectSpec(profileDir, spec, occupied)
+    if (inspection.conflicts.length > 0) {
+      throw new ApiError('bundle-conflict', `不兼容当前 web profile\n\n${inspection.name}@${inspection.version}\n冲突的 Cordis IDs：\n- ${inspection.conflicts.join('\n- ')}\n\n建议：安装到独立 TUI profile，或不要安装。`, 409)
     }
-    const after = await readManifest(profileDir)
-    const reconciled = await reconcileBundles(profileDir, before, after)
-    if (reconciled !== after) await writeManifest(profileDir, reconciled)
-    return { ok: true, restartRequired: true, spec, output: tail(output) }
+    const snapshot = await snapshotProfile(profileDir)
+    try {
+      const { code, output } = await runPnpm(['add', spec], profileDir)
+      if (code !== 0) throw new ApiError('install-failed', `pnpm add 失败（exit ${code}）\n${tail(output)}`, 500)
+      const after = await readManifest(profileDir)
+      const reconciled = await reconcileBundles(profileDir, before, after, inspection.name)
+      if (reconciled !== after) await writeManifest(profileDir, reconciled)
+      return { ok: true, restartRequired: true, spec, output: tail(output) }
+    } catch (error) {
+      await restoreProfile(profileDir, snapshot)
+      throw error
+    }
   }
 
   const remove = async (payload: unknown): Promise<Record<string, unknown>> => {
@@ -334,14 +421,18 @@ function buildApi(profileDir: string, logger?: HostContext['logger']) {
       throw new ApiError('bad-request', '非法插件名')
     }
     const before = await readManifest(profileDir)
-    const { code, output } = await runPnpm(['remove', name], profileDir)
-    if (code !== 0) {
-      throw new ApiError('remove-failed', `pnpm remove 失败（exit ${code}）\n${tail(output)}`, 500)
+    const snapshot = await snapshotProfile(profileDir)
+    try {
+      const { code, output } = await runPnpm(['remove', name], profileDir)
+      if (code !== 0) throw new ApiError('remove-failed', `pnpm remove 失败（exit ${code}）\n${tail(output)}`, 500)
+      const after = await readManifest(profileDir)
+      const reconciled = await reconcileBundles(profileDir, before, after)
+      if (reconciled !== after) await writeManifest(profileDir, reconciled)
+      return { ok: true, restartRequired: true, name, output: tail(output) }
+    } catch (error) {
+      await restoreProfile(profileDir, snapshot)
+      throw error
     }
-    const after = await readManifest(profileDir)
-    const reconciled = await reconcileBundles(profileDir, before, after)
-    if (reconciled !== after) await writeManifest(profileDir, reconciled)
-    return { ok: true, restartRequired: true, name, output: tail(output) }
   }
 
   const table: Record<string, (payload: unknown) => Promise<unknown> | unknown> = {

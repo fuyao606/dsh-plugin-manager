@@ -22,6 +22,8 @@ interface PluginRow {
   description: string
   isBundle: boolean
   enabled: boolean
+  status: 'enabled' | 'disabled' | 'blocked' | 'dependency'
+  conflicts: string[]
 }
 interface BuiltinRow {
   name: string
@@ -118,6 +120,8 @@ const styles: Record<string, React.CSSProperties> = {
   },
   badgeOn: { background: 'rgba(77,107,254,0.18)', color: '#9db2ff' },
   badgeOff: { background: 'rgba(128,128,128,0.12)', color: 'inherit' },
+  badgeBlocked: { background: 'rgba(224,90,90,0.18)', color: '#f2a1a1' },
+  conflict: { marginTop: 6, color: '#f2a1a1', whiteSpace: 'pre-wrap' },
   notice: {
     padding: '10px 12px',
     borderRadius: 8,
@@ -137,7 +141,8 @@ const styles: Record<string, React.CSSProperties> = {
   muted: { opacity: 0.55, fontSize: 12 },
 }
 
-function ToggleButton(props: { enabled: boolean; onClick: () => void; busy: boolean }) {
+function ToggleButton(props: { enabled: boolean; blocked: boolean; onClick: () => void; busy: boolean }) {
+  if (props.blocked) return null
   return (
     <button
       type="button"
@@ -236,13 +241,15 @@ function PluginManagerSection(): ReactNode {
                 {plugin.version !== '' ? `v${plugin.version}` : plugin.range}
                 {plugin.isBundle ? ' · bundle' : ' · 普通依赖'}
                 {plugin.description !== '' ? ` · ${plugin.description}` : ''}
+                {plugin.status === 'blocked' && <div style={styles.conflict}>冲突：{plugin.conflicts.join(', ')}</div>}
               </div>
             </div>
-            <span style={{ ...styles.badge, ...(plugin.enabled ? styles.badgeOn : styles.badgeOff) }}>
-              {plugin.enabled ? '已启用' : '已禁用'}
+            <span style={{ ...styles.badge, ...(plugin.status === 'blocked' ? styles.badgeBlocked : plugin.enabled ? styles.badgeOn : styles.badgeOff) }}>
+              {plugin.status === 'blocked' ? '已阻断' : plugin.status === 'dependency' ? '普通依赖' : plugin.enabled ? '已启用' : '已禁用'}
             </span>
             <ToggleButton
               enabled={plugin.enabled}
+              blocked={plugin.status === 'blocked' || plugin.status === 'dependency'}
               busy={busy !== null}
               onClick={() => mutate(plugin.name, plugin.enabled ? 'disable' : 'enable', { name: plugin.name })}
             />
